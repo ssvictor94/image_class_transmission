@@ -1,0 +1,383 @@
+model:
+  _target_: timm.create_model
+  model_name: deit_tiny_patch16_224.fb_in1k
+  pretrained: true
+training_pipeline:
+  optimizer:
+    _target_: torch.optim.Adam
+    lr: 0.001
+    eps: 1.0e-08
+    weight_decay: 0
+  augmentation:
+    train:
+      _target_: torchvision.transforms.Compose
+      _recursive_: true
+      transforms:
+      - _target_: torchvision.transforms.RandAugment
+        num_ops: 2
+        magnitude: 9
+      - _target_: torchvision.transforms.ColorJitter
+        brightness:
+        - 0.6
+        - 1.4
+        contrast:
+        - 0.6
+        - 1.4
+        saturation:
+        - 0.6
+        - 1.4
+        hue: 0
+      - _target_: torchvision.transforms.Resize
+        size:
+        - 224
+        - 224
+      - _target_: torchvision.transforms.RandomHorizontalFlip
+      - _target_: torchvision.transforms.ToTensor
+      - _target_: torchvision.transforms.Normalize
+        mean:
+        - 0.485
+        - 0.456
+        - 0.406
+        std:
+        - 0.229
+        - 0.224
+        - 0.225
+    test:
+      _target_: torchvision.transforms.Compose
+      _recursive_: true
+      transforms:
+      - _target_: torchvision.transforms.Resize
+        size:
+        - 224
+        - 224
+      - _target_: torchvision.transforms.ToTensor
+      - _target_: torchvision.transforms.Normalize
+        mean:
+        - 0.485
+        - 0.456
+        - 0.406
+        std:
+        - 0.229
+        - 0.224
+        - 0.225
+  dataloader:
+    _target_: torch.utils.data.DataLoader
+    batch_size: 128
+    shuffle: true
+    sampler: null
+    num_workers: 0
+    collate_fn: null
+    pin_memory: null
+    drop_last: false
+  schema:
+    epochs: 150
+    experiments: 1
+    train_batch_size: 256
+    eval_batch_size: 128
+    gradient_clipping_value: 1
+  dataset:
+    train:
+      _target_: torchvision.datasets.Imagenette
+      split: train
+      transform: ${training_pipeline.augmentation.train}
+      root: ${core.dataset_root}/imagenette
+      download: true
+      size: full
+    test:
+      _target_: torchvision.datasets.Imagenette
+      split: val
+      transform: ${training_pipeline.augmentation.test}
+      root: ${core.dataset_root}/imagenette
+      download: false
+      size: full
+  scheduler:
+    _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+    T_max: ${training_pipeline.schema.epochs}
+    eta_min: 1.0e-06
+pretraining_pipeline:
+  optimizer:
+    _target_: torch.optim.Adam
+    lr: 0.001
+    weight_decay: 0
+  dataset:
+    train:
+      _target_: torchvision.datasets.Imagenette
+      split: train
+      transform:
+        _target_: torchvision.transforms.Compose
+        _recursive_: true
+        transforms:
+        - _target_: torchvision.transforms.RandAugment
+          num_ops: 2
+          magnitude: 9
+        - _target_: torchvision.transforms.ColorJitter
+          brightness:
+          - 0.6
+          - 1.4
+          contrast:
+          - 0.6
+          - 1.4
+          saturation:
+          - 0.6
+          - 1.4
+          hue: 0
+        - _target_: torchvision.transforms.Resize
+          size:
+          - 224
+          - 224
+        - _target_: torchvision.transforms.RandomHorizontalFlip
+        - _target_: torchvision.transforms.ToTensor
+        - _target_: torchvision.transforms.Normalize
+          mean:
+          - 0.485
+          - 0.456
+          - 0.406
+          std:
+          - 0.229
+          - 0.224
+          - 0.225
+      root: ${core.dataset_root}/imagenette
+      download: true
+      size: full
+    test:
+      _target_: torchvision.datasets.Imagenette
+      split: val
+      transform:
+        _target_: torchvision.transforms.Compose
+        _recursive_: true
+        transforms:
+        - _target_: torchvision.transforms.Resize
+          size:
+          - 224
+          - 224
+        - _target_: torchvision.transforms.ToTensor
+        - _target_: torchvision.transforms.Normalize
+          mean:
+          - 0.485
+          - 0.456
+          - 0.406
+          std:
+          - 0.229
+          - 0.224
+          - 0.225
+      root: ${core.dataset_root}/imagenette
+      download: false
+      size: full
+  dataloader:
+    _target_: torch.utils.data.DataLoader
+    batch_size: 64
+    shuffle: true
+    sampler: null
+    num_workers: 0
+    collate_fn: null
+    pin_memory: null
+    drop_last: false
+  schema:
+    epochs: 100
+  scheduler:
+    _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+    T_max: ${pretraining_pipeline.schema.epochs}
+method:
+  model:
+    _target_: methods.proposal.SemanticVit
+    blocks_to_transform: 6
+  loss:
+    _target_: methods.proposal.AdaptiveTokenLoss
+    inner_flops_w: 1
+    output_flops_w: 2
+    inner_flops_type: margin
+    margin: 0.02
+final_evaluation:
+  semantic_flops:
+    _target_: methods.proposal.semantic_evaluation
+    budgets:
+    - 0.001
+    - 0.001
+    - 0.01
+    - 0.1
+    - 0.2
+    - 0.3
+    - 0.4
+    - 0.5
+    - 0.6
+    - 0.7
+    - 0.8
+    - 0.9
+    overwrite: false
+serialization:
+  load: true
+  save: true
+  values_to_skip:
+  - training_pipeline.schema.experiments
+  - final_evaluation
+  - serialization
+  - jscc
+  - comm_evaluation
+  values_to_add:
+  - training_pipeline.dataset.train._target_
+  - method.model._target_
+  - - method.loss.output_flops_w
+    - method.loss.inner_flops_w
+  values_to_append: null
+  values_to_prepend:
+  - jscc
+comm_evaluation:
+  semantic:
+    _target_: comm.evaluation.gaussian_snr_evaluation
+    monte_carlo_n: 1
+    snr:
+      _target_: builtins.range
+      _args_:
+      - -20
+      - 30
+      - 5
+    function:
+      _target_: methods.proposal.semantic_evaluation
+      budgets:
+      - 0.001
+      - 0.001
+      - 0.01
+      - 0.1
+      - 0.2
+      - 0.3
+      - 0.4
+      - 0.5
+      - 0.6
+      - 0.7
+      - 0.8
+      - 0.9
+      calculate_flops: false
+      _partial_: true
+      batch_size: 128
+core:
+  dataset_root: ./data
+  pretrained_root: ./pretrained_models
+  results_path: ./results
+device: 0
+jscc:
+  gaussian_noise:
+    splitting_point: 6
+    unwrap_after: true
+    unwrap_before: false
+    epochs: 100
+    freeze_model: true
+    channel:
+      _target_: comm.channel.GaussianNoiseChannel
+      snr:
+      - -10
+      - 10
+      use_training_snr: true
+    encoder:
+      _target_: comm.pipeline.BaseRealToComplexNN
+      output_size: 0.5
+      n_layers: 3
+      normalize: true
+      drop_last_activation: true
+    decoder:
+      _target_: comm.pipeline.ConcatComplexToRealNN
+      n_layers: 3
+  gaussian_no_training:
+    splitting_point: 6
+    unwrap_after: true
+    unwrap_before: false
+    epochs: 100
+    freeze_model: true
+    channel:
+      _target_: comm.channel.GaussianNoiseChannel
+      snr:
+      - -10
+      - 10
+      use_training_snr: false
+    encoder:
+      _target_: comm.pipeline.BaseRealToComplexNN
+      output_size: 0.5
+      n_layers: 3
+      normalize: true
+      drop_last_activation: true
+    decoder:
+      _target_: comm.pipeline.ConcatComplexToRealNN
+      n_layers: 3
+  gaussian_no_training_025:
+    splitting_point: 6
+    unwrap_after: true
+    unwrap_before: false
+    epochs: 100
+    freeze_model: true
+    channel:
+      _target_: comm.channel.GaussianNoiseChannel
+      snr:
+      - -10
+      - 10
+      use_training_snr: false
+    encoder:
+      _target_: comm.pipeline.BaseRealToComplexNN
+      output_size: 0.25
+      n_layers: 3
+      normalize: true
+      drop_last_activation: true
+    decoder:
+      _target_: comm.pipeline.ConcatComplexToRealNN
+      n_layers: 3
+  gaussian_noise_025:
+    splitting_point: 6
+    unwrap_after: true
+    unwrap_before: false
+    epochs: 100
+    freeze_model: true
+    channel:
+      _target_: comm.channel.GaussianNoiseChannel
+      snr:
+      - -10
+      - 10
+      use_training_snr: true
+    encoder:
+      _target_: comm.pipeline.BaseRealToComplexNN
+      output_size: 0.25
+      n_layers: 3
+      normalize: true
+      drop_last_activation: true
+    decoder:
+      _target_: comm.pipeline.ConcatComplexToRealNN
+      n_layers: 3
+  gaussian_no_training_01:
+    splitting_point: 6
+    unwrap_after: true
+    unwrap_before: false
+    epochs: 100
+    freeze_model: true
+    channel:
+      _target_: comm.channel.GaussianNoiseChannel
+      snr:
+      - -10
+      - 10
+      use_training_snr: false
+    encoder:
+      _target_: comm.pipeline.BaseRealToComplexNN
+      output_size: 0.1
+      n_layers: 3
+      normalize: true
+      drop_last_activation: true
+    decoder:
+      _target_: comm.pipeline.ConcatComplexToRealNN
+      n_layers: 3
+  gaussian_noise_01:
+    splitting_point: 6
+    unwrap_after: true
+    unwrap_before: false
+    epochs: 100
+    freeze_model: true
+    channel:
+      _target_: comm.channel.GaussianNoiseChannel
+      snr:
+      - -10
+      - 10
+      use_training_snr: true
+    encoder:
+      _target_: comm.pipeline.BaseRealToComplexNN
+      output_size: 0.1
+      n_layers: 3
+      normalize: true
+      drop_last_activation: true
+    decoder:
+      _target_: comm.pipeline.ConcatComplexToRealNN
+      n_layers: 3

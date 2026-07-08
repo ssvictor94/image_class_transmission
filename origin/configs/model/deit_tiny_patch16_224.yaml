@@ -1,0 +1,3 @@
+_target_: utils.create_timm_model_local
+model_name: deit_tiny_patch16_224.fb_in1k
+checkpoint_path: ./pretrained_models/deit_tiny_patch16_224-a1311bcf.pth

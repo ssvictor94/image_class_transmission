@@ -1,0 +1,8 @@
+defaults:
+  - optimizer: adam
+  - augmentation: imagenette_224
+  - dataloader: bs_128
+  - schema: default
+#  - evaluation: base
+  - dataset: imagenette
+  - scheduler: cosine
