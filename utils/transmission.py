@@ -25,13 +25,16 @@ from config import D_MODEL, TOTAL_PIXELS
 EVAL_MASK_THRESHOLD = 1e-3
 
 
+def progressive_layer_hard_mask(soft_mask, has_cls=True):
+    """官方 AdaptiveBlock 推理硬掩码：阈值二值化（eval_threshold=1e-3）。"""
+    return discretize_mask(soft_mask, threshold=EVAL_MASK_THRESHOLD, has_cls=has_cls)
+
+
 def topk_patch_mask(scores, alpha, prev_patch_mask=None, min_k=1):
     """
-    论文 Algorithm 1 硬选择：按预算 α 保留 top-k patch token。
+    编码器出口按预算 α 保留 top-k patch（保证 Fig.6/7 的 n_α≈αN）。
 
-    k = max(1, round(α · N_patch))，保证推理时活跃 token 数与 α 一致。
-    此前用 ReLU+阈值离散化时，α=0.05 仍保留 ~22% patch（~44 token），
-    导致低 ρ 准确率虚高。
+    仅用于最终 mask / STE，不要在每个 S_l 中间层调用。
     """
     B, N = scores.shape
     if prev_patch_mask is None:
@@ -53,59 +56,68 @@ def topk_patch_mask(scores, alpha, prev_patch_mask=None, min_k=1):
     return out
 
 
-def apply_budget_hard_mask(soft_mask, scores, alpha):
+def apply_budget_hard_mask(soft_mask, scores, alpha, has_cls=True):
     """
-    将 soft mask 替换为 top-k 硬 mask（CLS/budget 恒为 1）。
+    将 soft mask 替换为 top-k 硬 mask（budget 恒为 1；ViT 时 CLS 恒为 1）。
     scores: [B, N_patch]  token 重要性（f_l 输出）
     """
     B = soft_mask.size(0)
-    n_patch = scores.size(1)
-    prev = soft_mask[:, 1:-1] if soft_mask.size(1) > 2 else None
+    if has_cls:
+        prev = soft_mask[:, 1:-1] if soft_mask.size(1) > 2 else None
+    else:
+        prev = soft_mask[:, :-1] if soft_mask.size(1) > 1 else None
     patch_hard = topk_patch_mask(scores, alpha, prev_patch_mask=prev)
-    cls_one = torch.ones(B, 1, device=soft_mask.device, dtype=patch_hard.dtype)
     tail_one = torch.ones(B, 1, device=soft_mask.device, dtype=patch_hard.dtype)
-    return torch.cat([cls_one, patch_hard, tail_one], dim=1)
+    if has_cls:
+        cls_one = torch.ones(B, 1, device=soft_mask.device, dtype=patch_hard.dtype)
+        return torch.cat([cls_one, patch_hard, tail_one], dim=1)
+    return torch.cat([patch_hard, tail_one], dim=1)
 
 
-def ste_topk_mask(soft_mask, scores, alpha):
+def ste_topk_mask(soft_mask, scores, alpha, has_cls=True):
     """训练后期 STE：前向 top-k，反向走 soft mask。"""
-    hard = apply_budget_hard_mask(soft_mask, scores, alpha)
+    hard = apply_budget_hard_mask(soft_mask, scores, alpha, has_cls=has_cls)
     return hard + soft_mask - soft_mask.detach()
 
 
-def discretize_mask(mask, threshold=EVAL_MASK_THRESHOLD):
+def discretize_mask(mask, threshold=EVAL_MASK_THRESHOLD, has_cls=True):
     """
     推理离散化（Section IV-A, 式(12) 思想）:
       m_i = 1  if m_i > τ
       m_i = 0  otherwise
 
-    CLS token 与 budget token 恒为 1（不参与丢弃）。
+    budget token 恒为 1；ViT 时 CLS 也恒为 1。
     """
     hard = (mask > threshold).float()
-    hard[:, 0] = 1.0
+    if has_cls:
+        hard[:, 0] = 1.0
     if hard.size(1) > 1:
         hard[:, -1] = 1.0
     return hard
 
 
-def ste_discretize(mask, threshold=EVAL_MASK_THRESHOLD):
+def ste_discretize(mask, threshold=EVAL_MASK_THRESHOLD, has_cls=True):
     """
     Straight-Through Estimator: 前向硬离散化，反向对 soft mask 传梯度。
     用于 Stage 2 缩小训练 soft mask 与推理 hard mask 的差距。
     """
-    hard = discretize_mask(mask, threshold)
+    hard = discretize_mask(mask, threshold, has_cls=has_cls)
     return hard + mask - mask.detach()
 
 
-def count_active_tokens(mask, threshold=EVAL_MASK_THRESHOLD):
+def count_active_tokens(mask, threshold=EVAL_MASK_THRESHOLD, has_cls=True):
     """统计活跃 patch token 数（不含 CLS / budget）。"""
     active = mask > threshold
-    if active.size(1) > 2:
-        active = active[:, 1:-1]
+    if has_cls:
+        if active.size(1) > 2:
+            active = active[:, 1:-1]
+    else:
+        if active.size(1) > 1:
+            active = active[:, :-1]
     return active.float().sum(dim=1)
 
 
-def gather_active_tokens(tokens, mask, threshold=EVAL_MASK_THRESHOLD):
+def gather_active_tokens(tokens, mask, threshold=EVAL_MASK_THRESHOLD, has_cls=True):
     """
     将活跃 token gather 为紧凑序列，供 JSCC 编码器输入。
 
@@ -114,10 +126,10 @@ def gather_active_tokens(tokens, mask, threshold=EVAL_MASK_THRESHOLD):
 
     Returns:
         out:    [B, max_n_α, D]  padded 活跃 token
-        counts: [B] 每个样本的活跃 token 数 n_α（含 CLS）
+        counts: [B] 每个样本的活跃 token 数 n_α
     """
     B, N, D = tokens.shape
-    hard = discretize_mask(mask, threshold) if not torch.is_floating_point(mask) else mask
+    hard = discretize_mask(mask, threshold, has_cls=has_cls)
     if hard.dtype != torch.bool:
         hard = hard > threshold
 
@@ -141,14 +153,14 @@ def gather_active_tokens(tokens, mask, threshold=EVAL_MASK_THRESHOLD):
     return out, counts
 
 
-def scatter_tokens(recovered, original_shape, mask, threshold=EVAL_MASK_THRESHOLD):
+def scatter_tokens(recovered, original_shape, mask, threshold=EVAL_MASK_THRESHOLD, has_cls=True):
     """
     JSCC 解码后将恢复的 token scatter 回原序列位置。
 
     被丢弃位置保持零向量；budget token 位置不写入（由编码器本地生成）。
     """
     B, N, D = original_shape
-    hard = discretize_mask(mask, threshold)
+    hard = discretize_mask(mask, threshold, has_cls=has_cls)
     out = recovered.new_zeros(B, N, D)
 
     for b in range(B):
@@ -176,9 +188,9 @@ def compression_ratio_from_transmission(n_active_tokens, r, d_model=D_MODEL, tot
     return symbols / total_pixels
 
 
-def count_transmission_tokens(mask, threshold=EVAL_MASK_THRESHOLD):
-    """统计参与 JSCC 的 token 数（CLS + 活跃 patch，不含 budget）。"""
-    hard = discretize_mask(mask, threshold)
+def count_transmission_tokens(mask, threshold=EVAL_MASK_THRESHOLD, has_cls=True):
+    """统计参与 JSCC 的 token 数（活跃 patch [+CLS]，不含 budget）。"""
+    hard = discretize_mask(mask, threshold, has_cls=has_cls)
     if hard.size(1) > 1:
         hard = hard.clone()
         hard[:, -1] = 0.0

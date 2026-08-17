@@ -8,6 +8,8 @@ Imagenette 数据集加载（论文 Section VI 实验设置）
 
 与官方 configs/pretraining_pipeline/imagenette224.yaml 一致。
 """
+from pathlib import Path
+
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
@@ -34,10 +36,20 @@ def get_transforms():
 
 def get_dataloaders(batch_size=MICRO_BATCH_SIZE, num_workers=0):
     train_tf, val_tf = get_transforms()
-    root = str(IMAGENETTE_ROOT)
+    root = Path(IMAGENETTE_ROOT)
+    train_dir = root / "train"
+    val_dir = root / "val"
+    if not train_dir.is_dir():
+        raise FileNotFoundError(
+            f"找不到 Imagenette 训练集: {train_dir}\n"
+            "请设置环境变量，例如:\n"
+            "  export IMAGENETTE_ROOT=/mnt/c/Users/hp/Downloads/imagenette2\n"
+            "或在 Windows:\n"
+            "  set IMAGENETTE_ROOT=C:\\Users\\hp\\Downloads\\imagenette2"
+        )
 
-    train_ds = datasets.ImageFolder(f"{root}/train", transform=train_tf)
-    val_ds = datasets.ImageFolder(f"{root}/val", transform=val_tf)
+    train_ds = datasets.ImageFolder(str(train_dir), transform=train_tf)
+    val_ds = datasets.ImageFolder(str(val_dir), transform=val_tf)
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
@@ -47,4 +59,5 @@ def get_dataloaders(batch_size=MICRO_BATCH_SIZE, num_workers=0):
         val_ds, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=True,
     )
+    print(f"Imagenette root: {root}")
     return train_loader, val_loader

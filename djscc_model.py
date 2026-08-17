@@ -53,7 +53,7 @@ class FullDJSCCModel(nn.Module):
         self.head = vit_backbone.head
 
     def average_rho(self, n_active, r):
-        rho = compression_ratio_from_transmission(n_active, r)
+        rho = compression_ratio_from_transmission(n_active, r, d_model=self.d_model)
         if isinstance(rho, torch.Tensor):
             return rho
         return torch.tensor(rho, device=n_active.device if isinstance(n_active, torch.Tensor) else "cpu")
@@ -119,12 +119,7 @@ class FullDJSCCModel(nn.Module):
         return self.compression_decoders[self.r_key_map[r]]
 
     def freeze_jscc_only(self):
-        """
-        Stage 2 策略 v3：仅训练 JSCC 编解码器。
-
-        冻结 adaptive_encoder + remaining_blocks + norm + head，
-        避免服务器 block 适配噪声后抬高高 ρ 准确率。
-        """
+        """消融：仅训 JSCC（非论文默认）。"""
         for p in self.parameters():
             p.requires_grad = False
         for module in (self.compression_encoders, self.compression_decoders):
@@ -132,40 +127,35 @@ class FullDJSCCModel(nn.Module):
                 p.requires_grad = True
 
     def freeze_djscc_with_server(self):
-        """Stage 2 备选：训练 JSCC + 服务器 block（上一版策略）。"""
+        """
+        对齐官方 freeze_model=Yes:
+          训 JSCC + blocks_after；冻边缘 encoder 与 head/norm。
+        """
         for p in self.parameters():
             p.requires_grad = False
         for module in (
             self.compression_encoders,
             self.compression_decoders,
             self.remaining_blocks,
-            self.norm,
-            self.head,
         ):
             for p in module.parameters():
                 p.requires_grad = True
 
     def freeze_for_djscc(self):
-        """兼容旧接口，等同 freeze_jscc_only。"""
-        self.freeze_jscc_only()
+        self.freeze_djscc_with_server()
 
     def freeze_semantic(self):
         self.freeze_jscc_only()
 
     def set_djscc_train_mode(self):
-        """Stage 2 前向：冻结模块 eval；可训练模块 train。"""
+        """Stage 2：边缘 eval；JSCC/server blocks train；head/norm eval。"""
         self.adaptive_encoder.eval()
         self.compression_encoders.train()
         self.compression_decoders.train()
+        self.norm.eval()
+        self.head.eval()
         server_trainable = any(p.requires_grad for p in self.remaining_blocks.parameters())
-        if server_trainable:
-            self.remaining_blocks.train()
-            self.norm.train()
-            self.head.train()
-        else:
-            self.remaining_blocks.eval()
-            self.norm.eval()
-            self.head.eval()
+        self.remaining_blocks.train() if server_trainable else self.remaining_blocks.eval()
 
     def unfreeze_semantic(self):
         for p in self.parameters():

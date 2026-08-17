@@ -1,10 +1,10 @@
 """
-论文 Section VI 两阶段训练脚本
+论文 Section VI 两阶段训练脚本（对齐官方 main.py）
 
-Stage 2 策略 v3（更接近论文数值）:
-  - 仅训练 JSCC 编解码器，冻结服务器 block（DJSCC_FREEZE_SERVER）
-  - 55% batch 采样 α∈[0.05, 0.2]，强化低 ρ 端
-  - 70% batch 采样 SNR∈[-10, 0]
+Stage 2（freeze_model=Yes）:
+  - 训练 JSCC + blocks_after；冻结边缘 encoder 与 head/norm
+  - α 近均匀 ∈ (1e-3, 1-1e-3)；SNR 均匀 ∈ [-10, 10]
+  - 训练 soft mask；推理阈值二值化
 
 用法:
   python train.py --stage semantic
@@ -26,20 +26,18 @@ from config import (
     ALPHA_LOW_BIAS,
     ALPHA_LOW_MAX,
     ALPHA_LOW_MIN,
-    BEST_MODEL_PATH,
-    CHECKPOINT_DIR,
+    BACKBONE,
     DJSCC_EPOCHS,
     DJSCC_FREEZE_SERVER,
     DJSCC_STE_START_EPOCH,
-    FINAL_MODEL_PATH,
     LEARNING_RATE,
     MICRO_BATCH_SIZE,
     MIN_KEEP_RATIO_END,
     MIN_KEEP_RATIO_START,
     PROGRESSIVE_EPOCHS,
+    PROJECT_ROOT,
     R_VALUES_TRAIN,
     SEMANTIC_EPOCHS,
-    SEMANTIC_MODEL_PATH,
     SNR_LOW_BIAS,
     SNR_TRAIN_MAX,
     SNR_TRAIN_MIN,
@@ -59,10 +57,9 @@ def progressive_min_keep(epoch, total_prog=PROGRESSIVE_EPOCHS):
 
 
 def sample_alpha(batch_size, device, low_bias=ALPHA_LOW_BIAS):
-    """
-    低 ρ 偏置采样：low_bias 比例来自 α∈[ALPHA_LOW_MIN, ALPHA_LOW_MAX]，
-    其余来自 α∈[ALPHA_LOW_MAX, 1.0]。
-    """
+    """官方训练 alpha∈(1e-3, 1-1e-3)；low_bias>0 时为可选消融偏置。"""
+    if low_bias <= 0:
+        return torch.empty(batch_size, device=device).uniform_(1e-3, 1.0 - 1e-3)
     n_low = int(batch_size * low_bias)
     n_high = batch_size - n_low
     low = torch.empty(n_low, device=device).uniform_(ALPHA_LOW_MIN, ALPHA_LOW_MAX)
@@ -73,6 +70,11 @@ def sample_alpha(batch_size, device, low_bias=ALPHA_LOW_BIAS):
 
 
 def sample_snr(batch_size, device):
+    """官方：SNR 在 [SNR_TRAIN_MIN, SNR_TRAIN_MAX] 均匀采样。"""
+    if SNR_LOW_BIAS <= 0:
+        return torch.empty(batch_size, device=device).uniform_(
+            SNR_TRAIN_MIN, SNR_TRAIN_MAX,
+        )
     n_low = int(batch_size * SNR_LOW_BIAS)
     n_high = batch_size - n_low
     low = torch.empty(n_low, device=device).uniform_(SNR_TRAIN_MIN, 0.0)
@@ -93,6 +95,7 @@ def semantic_step(model, images, labels, alpha, epoch):
 
 
 def djscc_step(model, images, labels, alpha, r, snr_db, epoch):
+    # 官方：训练全程 soft mask（无 STE top-k）
     use_ste = epoch >= DJSCC_STE_START_EPOCH
     logits, _, _ = model.forward_full(
         images, alpha, r, snr_db,
@@ -103,7 +106,7 @@ def djscc_step(model, images, labels, alpha, r, snr_db, epoch):
     return F.cross_entropy(logits, labels)
 
 
-def train_epoch(model, loader, optimizer, epoch, stage, device):
+def train_epoch(model, loader, optimizer, epoch, stage, device, accum_steps=ACCUMULATION_STEPS):
     if stage == "djscc":
         model.set_djscc_train_mode()
     else:
@@ -118,26 +121,26 @@ def train_epoch(model, loader, optimizer, epoch, stage, device):
 
         if stage == "semantic":
             alpha = torch.empty(images.size(0), device=device).uniform_(0.0, 1.0)
-            loss = semantic_step(model, images, labels, alpha, epoch) / ACCUMULATION_STEPS
+            loss = semantic_step(model, images, labels, alpha, epoch) / accum_steps
         else:
             alpha = sample_alpha(images.size(0), device)
             r = random.choice(R_VALUES_TRAIN)
             snr_db = sample_snr(images.size(0), device)
-            loss = djscc_step(model, images, labels, alpha, r, snr_db, epoch) / ACCUMULATION_STEPS
+            loss = djscc_step(model, images, labels, alpha, r, snr_db, epoch) / accum_steps
 
         loss.backward()
 
-        if (batch_idx + 1) % ACCUMULATION_STEPS == 0 or (batch_idx + 1) == len(loader):
+        if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(loader):
             torch.nn.utils.clip_grad_norm_(
                 filter(lambda p: p.requires_grad, model.parameters()), 1.0,
             )
             optimizer.step()
             optimizer.zero_grad()
 
-        total_loss += loss.item() * ACCUMULATION_STEPS
+        total_loss += loss.item() * accum_steps
         n_batches += 1
         if batch_idx % 50 == 0:
-            print(f"  batch {batch_idx}, loss={loss.item() * ACCUMULATION_STEPS:.4f}")
+            print(f"  batch {batch_idx}, loss={loss.item() * accum_steps:.4f}")
 
     return total_loss / max(n_batches, 1)
 
@@ -166,40 +169,63 @@ def validation_score(model, val_loader, device):
 def main():
     parser = argparse.ArgumentParser(description="论文 Section VI 两阶段训练")
     parser.add_argument("--stage", choices=["semantic", "djscc"], default="semantic")
+    parser.add_argument(
+        "--backbone", choices=["mambavision", "vit"], default=None,
+        help="默认读 config.BACKBONE / 环境变量 DJSCC_BACKBONE",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    train_loader, val_loader = get_dataloaders(batch_size=MICRO_BATCH_SIZE)
+    backbone = (args.backbone or BACKBONE).lower()
+    checkpoint_dir = PROJECT_ROOT / "checkpoints" / backbone
+    semantic_path = checkpoint_dir / "semantic_pretrained.pth"
+    best_path = checkpoint_dir / "best_model.pth"
+    final_path = checkpoint_dir / "final_model.pth"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    if backbone == "mambavision":
+        micro_bs = int(os.environ.get("DJSCC_MICRO_BATCH", "16"))
+        accum = int(os.environ.get("DJSCC_ACCUM_STEPS", "16"))
+    else:
+        micro_bs = int(os.environ.get("DJSCC_MICRO_BATCH", str(MICRO_BATCH_SIZE)))
+        accum = int(os.environ.get("DJSCC_ACCUM_STEPS", str(ACCUMULATION_STEPS)))
+
+    train_loader, val_loader = get_dataloaders(batch_size=micro_bs)
+
+    print(f"骨干: {backbone}")
     print(f"训练集: {len(train_loader.dataset)}, 验证集: {len(val_loader.dataset)}")
-    print(f"Stage: {args.stage}, 等效 batch={MICRO_BATCH_SIZE * ACCUMULATION_STEPS}")
+    print(f"Stage: {args.stage}, micro_bs={micro_bs}, accum={accum}, 等效 batch={micro_bs * accum}")
+    print(f"Checkpoint dir: {checkpoint_dir}")
 
-    model = build_model(pretrained=True).to(args.device)
+    model = build_model(pretrained=True, backbone=backbone).to(args.device)
 
     if args.stage == "djscc":
         from utils.model_factory import _valid_checkpoint
-        if not _valid_checkpoint(SEMANTIC_MODEL_PATH):
+        if not _valid_checkpoint(semantic_path):
             raise SystemExit(
-                f"\n错误: Stage 1 权重无效: {SEMANTIC_MODEL_PATH}\n"
+                f"\n错误: Stage 1 权重无效: {semantic_path}\n"
                 "  该文件为空或不存在，请先完成语义预训练:\n"
-                "  python train.py --stage semantic\n"
+                f"  python train.py --stage semantic --backbone {backbone}\n"
             )
-        load_semantic_checkpoint(model, device=args.device)
+        load_semantic_checkpoint(model, path=semantic_path, device=args.device)
         if DJSCC_FREEZE_SERVER:
             model.freeze_jscc_only()
-            print("Stage2: 仅训练 JSCC，服务器 block 已冻结")
+            print("Stage2: 消融模式 — 仅训练 JSCC")
         else:
             model.freeze_djscc_with_server()
-            print("Stage2: 训练 JSCC + 服务器 block")
-        print(f"Stage2: α 低预算采样 {ALPHA_LOW_BIAS:.0%} ∈ [{ALPHA_LOW_MIN}, {ALPHA_LOW_MAX}]")
+            print("Stage2: 论文模式 — 训 JSCC + blocks_after，冻边缘与 head/norm")
+        if ALPHA_LOW_BIAS > 0:
+            print(f"Stage2: α 低预算偏置 {ALPHA_LOW_BIAS:.0%} ∈ [{ALPHA_LOW_MIN}, {ALPHA_LOW_MAX}]")
+        else:
+            print("Stage2: α ~ Uniform(1e-3, 1-1e-3)（对齐官方）")
+        print(f"Stage2: SNR ~ Uniform([{SNR_TRAIN_MIN}, {SNR_TRAIN_MAX}])")
         total_epochs = DJSCC_EPOCHS
-        save_path = BEST_MODEL_PATH
+        save_path = best_path
     else:
         model.unfreeze_semantic()
         total_epochs = SEMANTIC_EPOCHS
-        save_path = SEMANTIC_MODEL_PATH
+        save_path = semantic_path
 
     if args.resume and save_path.is_file():
         from utils.model_factory import _valid_checkpoint, load_checkpoint_state
@@ -217,11 +243,14 @@ def main():
     cosine = CosineAnnealingLR(optimizer, T_max=max(total_epochs - WARMUP_EPOCHS, 1), eta_min=1e-6)
 
     best_metric = -1.0
-    log_path = CHECKPOINT_DIR / f"train_{args.stage}.log"
+    log_path = checkpoint_dir / f"train_{args.stage}.log"
 
     for epoch in range(1, total_epochs + 1):
         print(f"\n=== Epoch {epoch}/{total_epochs} ({args.stage}) ===")
-        avg_loss = train_epoch(model, train_loader, optimizer, epoch, args.stage, args.device)
+        avg_loss = train_epoch(
+            model, train_loader, optimizer, epoch, args.stage, args.device,
+            accum_steps=accum,
+        )
 
         if epoch <= WARMUP_EPOCHS:
             warmup.step()
@@ -247,11 +276,11 @@ def main():
                 print(f"  -> saved {save_path}")
 
     if args.stage == "djscc":
-        save_checkpoint(model.state_dict(), FINAL_MODEL_PATH)
-        print(f"Final model: {FINAL_MODEL_PATH}")
+        save_checkpoint(model.state_dict(), final_path)
+        print(f"Final model: {final_path}")
     else:
-        save_checkpoint(model.state_dict(), SEMANTIC_MODEL_PATH)
-        print(f"Semantic model: {SEMANTIC_MODEL_PATH}")
+        save_checkpoint(model.state_dict(), semantic_path)
+        print(f"Semantic model: {semantic_path}")
 
 
 if __name__ == "__main__":

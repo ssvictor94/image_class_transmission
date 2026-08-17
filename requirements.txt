@@ -5,3 +5,8 @@ numpy
 pandas
 matplotlib
 tqdm
+einops
+# MambaVision（仅 WSL/Linux；Windows 原生通常无法编译 mamba-ssm）:
+#   pip install mamba-ssm --no-build-isolation --no-deps --no-cache-dir
+#   pip install mambavision --no-deps
+#   pip install timm==1.0.15 transformers==4.50.0

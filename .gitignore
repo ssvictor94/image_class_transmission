@@ -140,4 +140,7 @@ cython_debug/
 checkpoint_models/
 checkpoints/
 *.pth
+*.pth.tar
+weights/*
+!weights/.gitkeep
 .idea/

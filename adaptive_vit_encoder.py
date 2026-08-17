@@ -25,7 +25,7 @@ import torch
 from torch import nn
 
 from token_selection_module import TokenSelectionModule
-from utils.transmission import EVAL_MASK_THRESHOLD, apply_budget_hard_mask, ste_topk_mask
+from utils.transmission import apply_budget_hard_mask, ste_topk_mask
 from utils.vit_masked import forward_block_with_token_mask
 
 
@@ -110,14 +110,10 @@ class AdaptiveViTEncoder(nn.Module):
                 new_mask = self.selection_modules[sel_idx](
                     tokens, budget.squeeze(1), mask, min_keep_ratio
                 )
-                last_patch_scores = self.selection_modules[sel_idx].fl(tokens[:, 1:-1]).squeeze(-1)
-
-                if use_ste:
-                    from utils.transmission import ste_topk_mask
-                    new_mask = ste_topk_mask(new_mask, last_patch_scores, alpha_t)
-                elif use_hard_mask:
-                    from utils.transmission import apply_budget_hard_mask
-                    new_mask = apply_budget_hard_mask(new_mask, last_patch_scores, alpha_t)
+                last_patch_scores = self.selection_modules[sel_idx].fl(
+                    tokens[:, 1:-1]
+                ).squeeze(-1)
+                # 中间层 soft 累积；硬预算只在出口施加
                 mask = new_mask
 
             # 被丢弃 token 置零后再过 masked Transformer block
@@ -129,13 +125,12 @@ class AdaptiveViTEncoder(nn.Module):
                 # 记录该层 patch 平均掩码 m̄_l（用于式(9) 内层/外层预算损失）
                 layer_avg_masks.append(mask[:, 1:-1].mean(dim=1))
 
-        if use_hard_mask and last_patch_scores is not None:
-            from utils.transmission import apply_budget_hard_mask
-            mask = apply_budget_hard_mask(mask, last_patch_scores, alpha_t)
-            tokens = tokens * mask.unsqueeze(-1)
-        elif use_ste and last_patch_scores is not None:
-            from utils.transmission import ste_topk_mask
-            mask = ste_topk_mask(mask, last_patch_scores, alpha_t)
+        # 出口按 α 做 hard top-k（论文预算语义；保证 Fig.6/7 的 ρ 随 α 变化）
+        if (use_hard_mask or use_ste) and last_patch_scores is not None:
+            if use_ste and self.training:
+                mask = ste_topk_mask(mask, last_patch_scores, alpha_t)
+            else:
+                mask = apply_budget_hard_mask(mask, last_patch_scores, alpha_t)
             tokens = tokens * mask.unsqueeze(-1)
 
         return tokens, layer_avg_masks, mask
